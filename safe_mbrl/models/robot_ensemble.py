@@ -4,14 +4,9 @@ from typing import Sequence, Union
 
 from safe_mbrl.utils.ensembles import ProbabilisticEnsembleModel, EnsembleModel
 
-from safe_mbrl.utils.type_aliases import RobotState
+from safe_mbrl.utils.structs import RobotState
 
-# Model ensemble, pure jax.
-# Define loss function for training
-# Define prediction of joint position and joint velocities in foward
-# Compute forward kinematics, differentiable
-# Pure jax. 
-# 
+
 class RobotEnsemble(object):
     
     def __init__(self,
@@ -61,7 +56,7 @@ class RobotEnsemble(object):
             q = robot_state_or_q
         else:
             raise NotImplementedError("query the joint position as a jax array or feed with the robot_state")
-
+        #TODO
         pass
     
     def step(self, robot_state: RobotState) -> RobotState: # We roll everything, but the action is padded wirh zero

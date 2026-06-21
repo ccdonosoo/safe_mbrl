@@ -30,7 +30,7 @@ from safe_mbrl.envs.heap_m545 import HeapEnv as PlanEnv                     # le
 from safe_mbrl.envs.base import State
 from safe_mbrl.models.robot_ensemble import RobotEnsemble
 from safe_mbrl.models.online_trainer import OnlineTrainer
-from safe_mbrl.utils.type_aliases import RobotState, Dataset
+from safe_mbrl.utils.structs import RobotState, Dataset
 from safe_mbrl.mpc.icem import ICEM
 
 

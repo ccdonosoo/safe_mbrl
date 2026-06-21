@@ -23,7 +23,7 @@ import pytorch_kinematics as pk
 from safe_mbrl.models.robot_ensemble import RobotEnsemble
 from safe_mbrl.envs.heap_m545 import HeapEnv as PlanEnv, URDF_PATH, EE_BODY, ROOT_BODY
 from safe_mbrl.envs.base import State
-from safe_mbrl.utils.type_aliases import RobotState
+from safe_mbrl.safe_mbrl.utils.structs import RobotState
 
 jd, bd, H, K = 4, 10, 20, 64
 cfg = SimpleNamespace(action_penalty_coef=0.0)        # pure tracking reward

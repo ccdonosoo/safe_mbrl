@@ -4,13 +4,11 @@ import numpy as np
 from flax import nnx
 from typing import Sequence
 
-from safe_mbrl.utils.type_aliases import RobotState, Dataset
+from safe_mbrl.utils.structs import RobotState, Dataset
 
 
-# Important update, assymetric joint pos and joint vel, embedding. 
-# Check the entirity of this code, manually.
-# Also check the mppi code with the online trainer
-# Check the MPC algorithms , fulll, to see if there is no inconsitency.
+#TODO Add a mask argument, dual purpose: (i) Independence of inputs (J_turn) (ii) Robustness trianing 
+
 
 class OnlineTrainer:
 
@@ -45,14 +43,13 @@ class OnlineTrainer:
         self._logger.scalar_summary("train/train_loss", loss_train, self.epoch)
         self._logger.scalar_summary("train/val_loss", loss_val, self.epoch)
 
-    def train_model_bptt(self, seed: int = 0, verbose: bool = True):
+    def train_model_bptt(self, seed: int = 0, verbose: bool = True, val_samples: int = 100):
         key = jax.random.key(seed)
+        rng, key = jax.random.split(key)
         jd, bd = self.model.joint_dim, self.model.buffer_dim
         mode, dt, gamma = self.model.mode, self.model._dt, self._gamma
         H, Hv = self._horizon, self._horizon_val
 
-        # nnx transforms keep the ensemble as a tracked graph node (graph/state are
-        # split internally by nnx.jit), so a fixed batch size compiles once.
         ens = self.model.model
         optimizer = nnx.Optimizer(ens, self._tx, wrt=nnx.Param)
 
@@ -77,7 +74,7 @@ class OnlineTrainer:
                 key, states, actions = sample_rollout_datasets(self._train_dataset, H, self._batch_size, key, jd, bd)
                 train_losses.append(np.asarray(train_step(ens, optimizer, states, actions)))
 
-            _, vs, va = sample_rollout_datasets(self._val_dataset, Hv, 100, jax.random.key(0), jd, bd)
+            rng, vs, va = sample_rollout_datasets(self._val_dataset, Hv, val_samples, rng, jd, bd)
             val_nll = float(mean_rollout(rollout_loss, ens, vs, va, Hv))
             val_mse = float(mean_rollout(rollout_loss_mse, ens, vs, va, Hv))
             train_loss = float(np.mean(train_losses))
@@ -99,7 +96,7 @@ class OnlineTrainer:
 
 
 
-def _bptt_step(ens, state, action, joint_dim, mode, dt):
+def _model_step(ens, state, action, joint_dim, mode, dt):
     """One differentiable model step: predict -> integrate -> roll buffers, with
     the real `action` injected into the newest action slot."""
     mu, _ = jnp.split(ens(state.ravel()), 2, axis=-1)
@@ -127,7 +124,7 @@ def rollout_loss(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma
         qd_target = state_rollout.qd_buffer[i + 1, -joint_dim:]
         y = qd_target - state.get_qd() if mode == "dv" else qd_target
         loss = loss + ens._likelihood_loss(state.ravel(), y) * gamma ** i
-        state = _bptt_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt)
+        state = _model_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt)
         return (estate, state, loss)
 
     _, _, loss = jax.lax.fori_loop(0, horizon, body, (estate, state0, jnp.zeros(())))
@@ -142,7 +139,7 @@ def rollout_loss_mse(ens, state_rollout, action_sequence, joint_dim, mode, dt, g
     def body(i, carry):
         estate, state, loss = carry
         ens = nnx.merge(graphdef, estate)
-        state = _bptt_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt)
+        state = _model_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt)
         q_target = state_rollout.q_buffer[i + 1, -joint_dim:]
         loss = loss + jnp.mean((state.get_q() - q_target) ** 2) * gamma ** i
         return (estate, state, loss)

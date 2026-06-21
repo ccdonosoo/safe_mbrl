@@ -110,7 +110,8 @@ class MPPI(nnx.Module):
 
         self.policy = policy
 
-    def optimize(self, func: Callable, rng: Optional[jax.Array] = None,
+    def optimize(self, func: Callable,
+                 rng: Optional[jax.Array] = None,
                  initial_actions: Optional[jax.Array] = None,
                  clip_limits: Optional[tuple] = (-1., 1.)):
         """

@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from safe_mbrl.envs.heap_env.heap_example_env import HeapEnv
 from safe_mbrl.models.robot_ensemble import RobotEnsemble
 from safe_mbrl.models.online_trainer import OnlineTrainer
-from safe_mbrl.utils.type_aliases import Dataset
+from safe_mbrl.safe_mbrl.utils.structs import Dataset
 
 
 class ListLogger:

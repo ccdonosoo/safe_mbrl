@@ -101,7 +101,7 @@ class HeapEnv(gym.Env):
     self.target_trajectories = []
     self.target_joint_pos_histories = []
 
-  def sample_ref_traj(self):
+  def sample_ref_traj(self, start_q: None | torch.Tensor = None):
     """
       Generates a sample reference trajectory for the environment.
 
@@ -120,12 +120,23 @@ class HeapEnv(gym.Env):
       Returns:
         None
     """
-    self.ref_traj_joint_01 = self.generate_polynomial_traj(torch.rand(self.n_envs*self.actnet.no_dof, device=self.device), torch.rand(self.n_envs*self.actnet.no_dof, device=self.device), 1., 0.).reshape(self.n_envs, self.actnet.no_dof, -1).contiguous()
+    lo, hi = self.actnet.pos_limit[:, 0], self.actnet.pos_limit[:, 1]
+    
+    if start_q is not None:
+      start_q = torch.tensor(start_q, device=self.device)
+      start01 = ((start_q - lo) / (hi - lo)).clamp(0.0, 1.0)
+    else:
+      start01 = torch.rand(self.n_envs*self.actnet.no_dof, device=self.device)
+      
+    self.ref_traj_joint_01 = self.generate_polynomial_traj(start01,
+                                                           torch.rand(self.n_envs*self.actnet.no_dof, device=self.device),
+                                                           1.,
+                                                           0.).reshape(self.n_envs, self.actnet.no_dof, -1).contiguous()
     self.ref_traj_joint = torch.einsum('ijk,j->ijk', self.ref_traj_joint_01, self.actnet.pos_limit[:, 1] - self.actnet.pos_limit[:, 0]) + self.actnet.pos_limit[:, 0].unsqueeze(0).unsqueeze(-1).repeat(self.n_envs, 1, self.ref_traj_steps).contiguous()
     self.ref_traj_Tee = self.kinematics.forward_kinematics(self.ref_traj_joint.transpose(1,2).reshape(self.n_envs*self.ref_traj_steps, -1)).get_matrix().reshape(self.n_envs, self.ref_traj_steps, 4, 4)
     self.ref_traj_eepos = self.ref_traj_Tee[:, :, :3, 3]
   
-  def reset(self, seed=None, options=None):
+  def reset(self, seed=None, options=None, start_q=None, reset_model: bool = True):
     """
       Resets the environment to an initial state.
 
@@ -143,10 +154,11 @@ class HeapEnv(gym.Env):
     """
     super().reset(seed=seed)
 
-    self.sample_ref_traj()
-    self.actnet.reset_static_pos(self.ref_traj_joint[:,:,0])
-    self.dof_pos_history = (self.actnet.pos_buffer[:, 0]*self.actnet.posStds + self.actnet.posMeans).unsqueeze(-1).repeat(1, 1, self.n_history_steps)
-    self.dof_vel_history = (self.actnet.vel_buffer[:, 0]*self.actnet.velStds + self.actnet.velMeans).unsqueeze(-1).repeat(1, 1, self.n_history_steps)
+    self.sample_ref_traj(start_q)
+    if reset_model:
+      self.actnet.reset_static_pos(self.ref_traj_joint[:,:,0])
+      self.dof_pos_history = (self.actnet.pos_buffer[:, 0]*self.actnet.posStds + self.actnet.posMeans).unsqueeze(-1).repeat(1, 1, self.n_history_steps)
+      self.dof_vel_history = (self.actnet.vel_buffer[:, 0]*self.actnet.velStds + self.actnet.velMeans).unsqueeze(-1).repeat(1, 1, self.n_history_steps)
     self.ee_pos = self.kinematics.forward_kinematics(self.dof_pos_history[:,:,0]).get_matrix()[:, :3, 3]
     self.ee_vel = self.kinematics.jacobian(self.dof_pos_history[:,:,0]).matmul(self.dof_vel_history[:,:,0].unsqueeze(-1)).squeeze(-1)
     self.accel = (self.ee_vel - torch.zeros_like(self.ee_vel)) / self.t_step
@@ -412,6 +424,10 @@ class HeapEnv(gym.Env):
     print("Max err: ", np.max(tracking_error))
     print("Max vels: ", np.max(max_vels))
     print("Mean max vels: ", np.mean(max_vels))
+  
+  def cur_joints(self):
+    return (self.dof_pos_history.squeeze(0).cpu().numpy()[:, 0],
+            self.dof_vel_history.squeeze(0).cpu().numpy()[:, 0])
   
   def visualize(self, save_dir, video_name):
     """
