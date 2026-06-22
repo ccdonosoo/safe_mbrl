@@ -151,7 +151,7 @@ def main():
                           accel_penalty_coef=0,
                           accel_sign_penalty_coef=0,
                           track_mode="joint",
-                          qd_coef=0.1)   # MPPI tracks joint pos + vel
+                          qd_coef=0.05)   # MPPI tracks joint pos + vel
     
     sim = SimEnv(n_envs=1, use_act_net=True, n_history_steps=bd,
                  n_ref_steps=15, t_step=0.04, t_traj=6.0, cfg=cfg)
