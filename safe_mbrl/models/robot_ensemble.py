@@ -16,7 +16,7 @@ class RobotEnsemble(object):
                  mode: str = "dv", # "v, dv"
                  activation: str = "silu",
                  key: jax.Array = jax.random.key(0),
-                 features: Sequence[int] = (128, 128),
+                 features: Sequence[int] = (128, 128, 128),
                  num_ensembles: int = 5,
                  dt: float = 0.04
                  ):

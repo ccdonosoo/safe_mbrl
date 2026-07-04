@@ -110,6 +110,25 @@ class HeapEnv(Env):
         self._track_mode = getattr(cfg, "track_mode", "joint") if cfg is not None else "joint"
         self._rot_coef = getattr(cfg, "rot_coef", 1.0) if cfg is not None else 1.0        # attitude tracking
         self._qd_coef = getattr(cfg, "qd_coef", 0.1) if cfg is not None else 1.0          # joint-velocity tracking
+        # Combined joint-mode loss: joint_weight * ||q - q_ref||^2 + ee_weight *
+        # ||ee_xyz(q) - ee_xyz(q_ref)||^2. ee_weight = 0 -> pure joint tracking.
+        self._joint_weight = getattr(cfg, "joint_weight", 1.0) if cfg is not None else 1.0
+        self._ee_weight = getattr(cfg, "ee_weight", 0.0) if cfg is not None else 0.0
+        # Per-joint scale for the joint-space cost: q/qd errors are divided by it
+        # (the runner passes the safe range q_max - q_min), so every joint is
+        # tracked with equal RELATIVE importance regardless of its range.
+        # None -> ones (legacy raw-radians cost).
+        scale = getattr(cfg, "q_cost_scale", None) if cfg is not None else None
+        self._q_scale = (jnp.ones(self._jd) if scale is None
+                         else jnp.asarray(scale, jnp.float32))
+        # Output EMA modeled INSIDE the rollout: the dynamics and the rate
+        # penalty see the filtered action a = alpha * a_plan + (1 - alpha) *
+        # a_applied_prev, mirroring the deployment-side filter, so the planner
+        # optimizes knowing its raw plan will be smoothed. 1.0 = no filter.
+        self._ema_alpha = getattr(cfg, "action_ema_alpha", 1.0) if cfg is not None else 1.0
+        # EE xyz of the joint reference, computed ONCE per reference window (jitted),
+        # not per MPPI sample inside the rollout.
+        self._ee_ref_fk = jax.jit(jax.vmap(self.fk.ee_pos))
         self._graphdef, self._params = nnx.split(model.model)
 
     def reset(self, rng: jax.Array) -> State:
@@ -125,6 +144,8 @@ class HeapEnv(Env):
                 "step": jnp.zeros((), jnp.int32), "params": self._params}
         if self._track_mode == "joint":
             info["q_target_seq"] = q_target[None, :]                      # (1, jd)
+            if self._ee_weight > 0.0:
+                info["ee_target_seq"] = self.fk.ee_pos(q_target)[None]    # (1, 3)
         else:
             pos, R = self.fk.ee_pose(q_target)                           # CABIN-frame target pose
             info["ee_target_seq"] = jnp.eye(4).at[:3, :3].set(R).at[:3, 3].set(pos)[None]   # (1, 4, 4)
@@ -133,25 +154,31 @@ class HeapEnv(Env):
 
         return State(rs, self._get_obs(rs, info), z, z, {"reward": z}, info)
     
-    def make_traj_state(self, q_buf, qd_buf, act_buf, target_seq, jd, aux_seq=None):
+    def make_traj_state(self, q_buf, qd_buf, act_buf, target_seq, jd, aux_seq=None,
+                        last_action=None):
         # Important method for real world deployment -> here we just set the inputs from the
         # Real world, as q_buf, qd_buf, and act_buf, and the reference window `target_seq`.
         # `target_seq`/`aux_seq` follow the env's track_mode:
         #   "pose"  -> target_seq = EE pose seq (T,4,4) or position seq (T,3); aux_seq = twist (T,6)
         #   "joint" -> target_seq = joint-pos seq (T,jd);                      aux_seq = joint-vel (T,jd)
+        # `last_action` anchors the action-rate penalty of the FIRST rollout step to
+        # the command actually applied last tick (None -> zeros, legacy behavior).
 
         rs = RobotState(q_buffer=jnp.asarray(q_buf),
                         qd_buffer=jnp.asarray(qd_buf),
                         act_buffer=jnp.asarray(act_buf),
                         q_dim=jd)
 
-        info = {"last_action": jnp.zeros(jd),
+        info = {"last_action": (jnp.zeros(jd) if last_action is None
+                                else jnp.asarray(last_action)),
                 "step": jnp.zeros((), jnp.int32),
                 "params": self._params}
         if self._track_mode == "joint":
             info["q_target_seq"] = jnp.asarray(target_seq)
             if aux_seq is not None:
                 info["qd_target_seq"] = jnp.asarray(aux_seq)
+            if self._ee_weight > 0.0:
+                info["ee_target_seq"] = self._ee_ref_fk(jnp.asarray(target_seq))  # (T, 3)
         else:
             info["ee_target_seq"] = jnp.asarray(target_seq)
             if aux_seq is not None:
@@ -163,6 +190,12 @@ class HeapEnv(Env):
 
     def step(self, state: State, action: jax.Array) -> State:
         action = jnp.clip(action, -1.0, 1.0)
+        # Apply the modeled output EMA: from here on `action` is the APPLIED
+        # action (what the machine would receive), and info["last_action"]
+        # carries the filter memory through the rollout.
+        if self._ema_alpha < 1.0:
+            action = (self._ema_alpha * action
+                      + (1.0 - self._ema_alpha) * state.info["last_action"])
 
         # merge a fresh ensemble from the carried params, then advance one BPTT-consistent step
         ens = nnx.merge(self._graphdef, state.info["params"])
@@ -182,16 +215,25 @@ class HeapEnv(Env):
     def _track_reward(self, rs: RobotState, info, i) -> jax.Array:
         """Reward for tracking THIS rollout step's reference (OOB index clamps to last).
         Two modes, selected by self._track_mode:
-          "joint" -> -||q - q_ref||^2 (- qd_coef ||qd - qd_ref||^2 if a qd ref is given)
+          "joint" -> -joint_weight ||(q - q_ref) / s||^2 - ee_weight ||ee_xyz - ee_xyz_ref||^2
+                     (- qd_coef ||(qd - qd_ref) / s||^2 if a qd ref is given), with s the
+                     per-joint q_cost_scale (safe range) so all joints weigh equally in
+                     RELATIVE terms. The EE xyz term (mjx FK of q vs FK of q_ref) is
+                     active when ee_weight > 0.
           "pose"  -> EE TF error: -||pos - pos_ref||^2 (- rot_coef ||e_R||^2 when the
                      reference is a full (4,4) homogeneous transform; a (3,) reference is
                      position-only for back-compat) (- twist_coef ||twist - twist_ref||^2
                      when a twist ref is given). EE comes from the differentiable mjx FK.
         """
         if self._track_mode == "joint":
-            reward = -jnp.sum((rs.get_q() - info["q_target_seq"][i]) ** 2)
+            q_err = (rs.get_q() - info["q_target_seq"][i]) / self._q_scale
+            reward = -self._joint_weight * jnp.sum(q_err ** 2)
             if "qd_target_seq" in info:
-                reward = reward - self._qd_coef * jnp.sum((rs.get_qd() - info["qd_target_seq"][i]) ** 2)
+                qd_err = (rs.get_qd() - info["qd_target_seq"][i]) / self._q_scale
+                reward = reward - self._qd_coef * jnp.sum(qd_err ** 2)
+            if "ee_target_seq" in info:
+                reward = reward - self._ee_weight * jnp.sum(
+                    (self.fk.ee_pos(rs.get_q()) - info["ee_target_seq"][i]) ** 2)
             return reward
 
         target = info["ee_target_seq"][i]

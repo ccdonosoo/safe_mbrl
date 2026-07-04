@@ -113,7 +113,7 @@ def _model_step(ens, state, action, joint_dim, mode, dt):
     return state.replace(q_buffer=q_buffer, qd_buffer=qd_buffer, act_buffer=act_buffer)
 
 
-def rollout_loss(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma, horizon, scale_q_loss:float=1.0):
+def rollout_loss(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma, horizon, scale_q_loss:float=0.0):
     """Discounted open-loop NLL over the horizon (requires a PE ensemble)."""
     graphdef, estate = nnx.split(ens)          # thread params through the loop carry
     state0 = state_rollout.take(0)
