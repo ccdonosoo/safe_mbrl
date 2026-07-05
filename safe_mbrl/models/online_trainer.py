@@ -7,7 +7,7 @@ from typing import Sequence
 from safe_mbrl.utils.structs import RobotState, Dataset
 
 
-#TODO Add a mask argument, dual purpose: (i) Independence of inputs (J_turn) (ii) Robustness trianing 
+#TODO Robustness training: random multiplicative masks sampled per batch.
 
 
 class OnlineTrainer:
@@ -49,12 +49,13 @@ class OnlineTrainer:
         jd, bd = self.model.joint_dim, self.model.buffer_dim
         mode, dt, gamma = self.model.mode, self.model._dt, self._gamma
         H, Hv = self._horizon, self._horizon_val
+        idx = getattr(self.model, "_input_idx", None)
 
         ens = self.model.model
         optimizer = nnx.Optimizer(ens, self._tx, wrt=nnx.Param)
 
         def mean_rollout(loss_single, ens, states, actions, horizon):
-            f = lambda e, s, a: loss_single(e, s, a, jd, mode, dt, gamma, horizon)
+            f = lambda e, s, a: loss_single(e, s, a, jd, mode, dt, gamma, horizon, input_idx=idx)
             return jnp.mean(nnx.vmap(f, in_axes=(None, 0, 0))(ens, states, actions))
 
         @nnx.jit
@@ -96,10 +97,15 @@ class OnlineTrainer:
 
 
 
-def _model_step(ens, state, action, joint_dim, mode, dt):
+def _featurize(state, input_idx):
+    x = state.ravel()
+    return x if input_idx is None else x[input_idx]
+
+
+def _model_step(ens, state, action, joint_dim, mode, dt, input_idx=None):
     """One differentiable model step: predict -> integrate -> roll buffers, with
     the real `action` injected into the newest action slot."""
-    mu, _ = jnp.split(ens(state.ravel()), 2, axis=-1)
+    mu, _ = jnp.split(ens(_featurize(state, input_idx)), 2, axis=-1)
     if mu.ndim > 1:                              # PE: (num_ensembles, joint_dim)
         mu = jnp.mean(mu, axis=0)
 
@@ -113,7 +119,7 @@ def _model_step(ens, state, action, joint_dim, mode, dt):
     return state.replace(q_buffer=q_buffer, qd_buffer=qd_buffer, act_buffer=act_buffer)
 
 
-def rollout_loss(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma, horizon, scale_q_loss:float=0.0):
+def rollout_loss(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma, horizon, scale_q_loss:float=0.0, input_idx=None):
     """Discounted open-loop NLL over the horizon (requires a PE ensemble)."""
     graphdef, estate = nnx.split(ens)          # thread params through the loop carry
     state0 = state_rollout.take(0)
@@ -123,8 +129,8 @@ def rollout_loss(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma
         ens = nnx.merge(graphdef, estate)
         qd_target = state_rollout.qd_buffer[i + 1, -joint_dim:]
         y = qd_target - state.get_qd() if mode == "dv" else qd_target
-        loss = loss + ens._likelihood_loss(state.ravel(), y) * gamma ** i
-        state = _model_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt)
+        loss = loss + ens._likelihood_loss(_featurize(state, input_idx), y) * gamma ** i
+        state = _model_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt, input_idx)
         q_err = state.get_q() - state_rollout.q_buffer[i + 1, -joint_dim:]
         loss = loss + scale_q_loss * jnp.mean(jnp.square(q_err))
         return (estate, state, loss)
@@ -133,7 +139,7 @@ def rollout_loss(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma
     return loss / horizon
 
 
-def rollout_loss_mse(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma, horizon):
+def rollout_loss_mse(ens, state_rollout, action_sequence, joint_dim, mode, dt, gamma, horizon, input_idx=None):
     """Discounted open-loop MSE on joint position (model-agnostic eval metric)."""
     graphdef, estate = nnx.split(ens)
     state0 = state_rollout.take(0)
@@ -141,7 +147,7 @@ def rollout_loss_mse(ens, state_rollout, action_sequence, joint_dim, mode, dt, g
     def body(i, carry):
         estate, state, loss = carry
         ens = nnx.merge(graphdef, estate)
-        state = _model_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt)
+        state = _model_step(ens, state, action_sequence[i + 1], joint_dim, mode, dt, input_idx)
         q_target = state_rollout.q_buffer[i + 1, -joint_dim:]
         loss = loss + jnp.mean((state.get_q() - q_target) ** 2) * gamma ** i
         return (estate, state, loss)

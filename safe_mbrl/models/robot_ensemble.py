@@ -1,43 +1,56 @@
 import jax
 import jax.numpy as jnp
-from typing import Sequence, Union
+from typing import Dict, Optional, Sequence, Union
 
 from safe_mbrl.utils.ensembles import ProbabilisticEnsembleModel, EnsembleModel
 
 from safe_mbrl.utils.structs import RobotState
 
+_MASK_KEYS = ("q", "qd", "act")
+
+
+
 
 class RobotEnsemble(object):
-    
+
     def __init__(self,
                  joint_dim: int = 4,
-                 buffer_dim: int = 10, 
+                 buffer_dim: int = 10,
                  model_type: str = "PE",
                  mode: str = "dv", # "v, dv"
                  activation: str = "silu",
                  key: jax.Array = jax.random.key(0),
                  features: Sequence[int] = (128, 128, 128),
                  num_ensembles: int = 5,
-                 dt: float = 0.04
+                 dt: float = 0.04,
+                 mask: Optional[Dict[str, Sequence[int]]] = None
                  ):
-        
+
         self.joint_dim = joint_dim
         self.buffer_dim = buffer_dim
         self.model_type = model_type
         self.mode = mode
         self._dt = dt
-        
+        self.mask = mask
+        self._input_idx = (None if mask is None
+                           else _build_input_index(mask, joint_dim, buffer_dim))
+
         if self.mode not in ("v", "dv"):
             raise NotImplementedError(f"Just dv or v prediction, not {self.mode}")
-        
+
         self.build_model(
-            input_dim = joint_dim*buffer_dim*3, # Joint position, velocity, and action buffer
+            input_dim = (joint_dim*buffer_dim*3 if mask is None # Joint position, velocity, and action buffer
+                         else int(self._input_idx.size)),
             features = features,
             num_ensembles = num_ensembles,
-            output_dim = joint_dim,             # We predict v or dv 
+            output_dim = joint_dim,             # We predict v or dv
             activation = activation,
             key = key
         )
+
+    def featurize(self, robot_state: RobotState) -> jax.Array:
+        x = robot_state.ravel()
+        return x if self._input_idx is None else x[self._input_idx]
     
     def build_model(self, **kwargs):
         if self.model_type == "PE":
@@ -49,18 +62,9 @@ class RobotEnsemble(object):
         
     
 
-    def fk(self, robot_state_or_q: Union[jax.Array, RobotState]):
-        if isinstance(robot_state_or_q, RobotState):
-            q = robot_state_or_q.get_q()
-        elif isinstance(robot_state_or_q, jax.Array):
-            q = robot_state_or_q
-        else:
-            raise NotImplementedError("query the joint position as a jax array or feed with the robot_state")
-        #TODO
-        pass
-    
+
     def step(self, robot_state: RobotState) -> RobotState: # We roll everything, but the action is padded wirh zero
-        prediction = self.model(robot_state.ravel())
+        prediction = self.model(self.featurize(robot_state))
         mu , _ = jnp.split(prediction, 2, axis=-1)
         
         if self.model_type == "PE":
@@ -89,5 +93,25 @@ class RobotEnsemble(object):
         return robot_state
             
             
+def _build_input_index(mask: Dict[str, Sequence[int]], joint_dim: int, buffer_dim: int) -> jax.Array:
+    # mask: {"q"|"qd"|"act": newest steps kept per joint}, 0 drops the signal,
+    # missing key keeps the full buffer. Eager only (data-dependent size).
+    unknown = set(mask) - set(_MASK_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown mask keys {unknown}; expected a subset of {_MASK_KEYS}")
+    full = [buffer_dim] * joint_dim
+    rows = [list(mask.get(k, full)) for k in _MASK_KEYS]
+    for key, row in zip(_MASK_KEYS, rows):
+        if len(row) != joint_dim:
+            raise ValueError(f"mask[{key!r}] must have {joint_dim} entries, got {len(row)}")
+        if not all(0 <= lag <= buffer_dim for lag in row):
+            raise ValueError(f"mask[{key!r}] lags must be in [0, {buffer_dim}], got {row}")
+    if not all(lag >= 1 for lag in rows[2]):
+        raise ValueError("mask['act'] lags must be >= 1")
+
+    lags = jnp.asarray(rows, dtype=jnp.int32)
+    t = jnp.arange(buffer_dim)[None, :, None]
+    keep = t >= buffer_dim - lags[:, None, :]
+    return jnp.flatnonzero(keep)
     
 

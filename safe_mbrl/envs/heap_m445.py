@@ -1,9 +1,9 @@
 """Minimal HeapEnv for the M445 arm.
 
-Brax-style JAX env, identical to heap_m545 but for the M445: dynamics come from a
-learned RobotEnsemble (JAX) and the end-effector pose is computed with mjx forward
-kinematics from the M445 URDF. Same 4-DOF arm in the CABIN frame (boom, stick, tele,
-pitch); the cabin slew (J_TURN) is fixed in the URDF since it does not affect EE-in-CABIN.
+Brax-style JAX env: dynamics from a learned RobotEnsemble, EE pose via mjx FK.
+Two modes selected by the model's joint_dim: 4 DOF (arm only, J_TURN fixed, EE in
+the CABIN frame) or 5 DOF (J_TURN made revolute, EE in the BASE frame so the slew
+moves the EE; qpos order [turn, boom, stick, tele, pitch]).
 """
 import os
 import xml.etree.ElementTree as ET
@@ -21,61 +21,59 @@ from safe_mbrl.models.robot_ensemble import RobotEnsemble
 
 file_path = os.path.dirname(os.path.abspath(__file__))
 URDF_PATH = os.path.join(file_path, "heap_env/rsc/m445/m445_shovel_fixed_w_cabin.urdf")
-EE_BODY, ROOT_BODY = "ENDEFFECTOR_CONTACT", "CABIN"
+EE_BODY = "ENDEFFECTOR_CONTACT"
+ROOT_BODY_4DOF, ROOT_BODY_5DOF = "CABIN", "BASE"
 
 # M445 arm joint ranges from the URDF limits (order boom, stick, tele, pitch). Reset samples reachable.
 POS_LIMIT = jnp.array([[-1.38, 0.36], [0.59, 2.73], [0.0, 1.598], [-0.66, 2.298]])
+# J_TURN range for the 5-DOF mode. TODO: real safe slew range before hardware use.
+TURN_LIMIT = jnp.array([[-3.1416, 3.1416]])
 
 
-def _quat2mat(q):
-    w, x, y, z = q
-    return jnp.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
-        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
-    ])
-
-
-def _so3_error(R, R_d):
-    """SO(3) attitude error vector e_R = 0.5 * vee(R_d^T R - R^T R_d) (Lee et al.,
-    geometric tracking). |e_R| ~ sin(angle) between R and R_d; zero iff R == R_d."""
-    M = R_d.T @ R - R.T @ R_d
-    return 0.5 * jnp.array([M[2, 1], M[0, 2], M[1, 0]])
 
 
 class M445FK:
-    """mjx forward kinematics: joint vector -> EE position in the CABIN frame.
+    """mjx FK: joint vector -> EE position in the root frame (CABIN for 4 DOF,
+    BASE with slew=True, which rewrites J_TURN to a revolute z-joint).
 
     The URDF has .dae meshes mujoco can't read, so visual/collision geoms are
     stripped; `fusestatic=false` keeps the CABIN / ENDEFFECTOR_CONTACT frames
     (mujoco otherwise welds fixed-joint bodies away).
     """
 
-    def __init__(self, urdf_path=URDF_PATH):
+    def __init__(self, urdf_path=URDF_PATH, slew=False):
         root = ET.parse(urdf_path).getroot()
         for link in root.findall("link"):
             for tag in ("visual", "collision"):
                 for e in link.findall(tag):
                     link.remove(e)
+        if slew:
+            j = root.find("joint[@name='J_TURN']")
+            j.set("type", "revolute")
+            ET.SubElement(j, "axis", {"xyz": "0 0 1"})
+            ET.SubElement(j, "limit", {"lower": str(float(TURN_LIMIT[0, 0])),
+                                       "upper": str(float(TURN_LIMIT[0, 1])),
+                                       "effort": "100000", "velocity": "10"})
         ET.SubElement(ET.SubElement(root, "mujoco"), "compiler",
                       {"fusestatic": "false", "balanceinertia": "true"})
         m = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
 
         self._mx = mjx.put_model(m)
         self._ee = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, EE_BODY)
-        self._root = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, ROOT_BODY)
+        self._root = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY,
+                                       ROOT_BODY_5DOF if slew else ROOT_BODY_4DOF)
         self.jnt_range = jnp.asarray(m.jnt_range)      # (nq, 2)
         self.nq = m.nq
 
     def ee_pos(self, q):
-        """q: (nq,) -> EE position (3,) expressed in the CABIN frame."""
+        """q: (nq,) -> EE position (3,) expressed in the root frame."""
         d = mjx.make_data(self._mx).replace(qpos=q)
         d = mjx.kinematics(self._mx, d)
         R_root = _quat2mat(d.xquat[self._root])
         return R_root.T @ (d.xpos[self._ee] - d.xpos[self._root])
 
     def ee_pose(self, q):
-        """q: (nq,) -> (EE position (3,), EE rotation (3,3)) in the CABIN frame."""
+        """q: (nq,) -> (EE position (3,), EE rotation (3,3)) in the root frame."""
         d = mjx.make_data(self._mx).replace(qpos=q)
         d = mjx.kinematics(self._mx, d)
         Rt = _quat2mat(d.xquat[self._root]).T
@@ -84,7 +82,7 @@ class M445FK:
         return pos, R
 
     def ee_twist(self, q, qd):
-        """q, qd: (nq,) -> EXACT 6D EE twist [v; w] in the CABIN frame, via the geometric Jacobian J(q) @ qd"""
+        """q, qd: (nq,) -> EXACT 6D EE twist [v; w] in the root frame, via the geometric Jacobian J(q) @ qd"""
         d = mjx.make_data(self._mx).replace(qpos=q)
         d = mjx.kinematics(self._mx, d)
         d = mjx.com_pos(self._mx, d)
@@ -98,8 +96,14 @@ class HeapEnv(Env):
 
     def __init__(self, model, cfg=None):
         self.cfg = cfg
-        self.fk = M445FK()
         self._jd = model.joint_dim
+        if self._jd not in (4, 5):
+            raise ValueError(f"HeapEnv supports 4 (arm) or 5 (J_TURN + arm) joints, got {self._jd}")
+        self._slew = self._jd == 5
+        self.fk = M445FK(slew=self._slew)
+        self._pos_limit = (jnp.concatenate([TURN_LIMIT, POS_LIMIT])
+                           if self._slew else POS_LIMIT)
+        self._input_idx = getattr(model, "_input_idx", None)
         self._bd = model.buffer_dim
         self._mode = model.mode
         self._dt = model._dt
@@ -133,7 +137,7 @@ class HeapEnv(Env):
 
     def reset(self, rng: jax.Array) -> State:
         rng, r_tgt, r_init = jax.random.split(rng, 3)
-        lo, hi = POS_LIMIT[:, 0], POS_LIMIT[:, 1]
+        lo, hi = self._pos_limit[:, 0], self._pos_limit[:, 1]
         q_target = jax.random.uniform(r_tgt, (self._jd,), minval=lo, maxval=hi)
         
         q0 = jax.random.uniform(r_init, (self._jd,), minval=lo, maxval=hi)
@@ -199,7 +203,8 @@ class HeapEnv(Env):
 
         # merge a fresh ensemble from the carried params, then advance one BPTT-consistent step
         ens = nnx.merge(self._graphdef, state.info["params"])
-        rs = _model_step(ens, state.pipeline_state, action, self._jd, self._mode, self._dt)
+        rs = _model_step(ens, state.pipeline_state, action, self._jd, self._mode, self._dt,
+                         self._input_idx)
 
         i = state.info["step"]
         # tracking reward + action-rate penalty over the rollout (mirrors the sim's
@@ -306,25 +311,18 @@ class HeapEnv(Env):
         return "mjx-fk + learned-ensemble dynamics"
 
 
-if __name__ == "__main__":
-    p_start = jnp.array([0.,0.1,0.2,0.04], dtype = jnp.float32)
-    p_end = jnp.array([0.4,.6,0.3,0.6], dtype=jnp.float32)
-    
-    p_min = 0.0 
-    p_max = 0.6
-    jd, bd = 4, 15
-    model = RobotEnsemble(joint_dim=jd, buffer_dim=bd, model_type="PE", mode="v", num_ensembles=5)
-    env = HeapEnv(model)
-    
-    position = env.generate_polynomial_traj(p_start, p_end, p_max, p_min)
-    import matplotlib.pyplot as plt
-    
-    plt.plot(position)
-    plt.show()
-    print(position.shape)
-    #key = jax.random.key(0)
-    
-    #env_state = env.reset(key)
-    
+def _quat2mat(q):
+    w, x, y, z = q
+    return jnp.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+    ])
 
+
+def _so3_error(R, R_d):
+    """SO(3) attitude error vector e_R = 0.5 * vee(R_d^T R - R^T R_d) (Lee et al.,
+    geometric tracking). |e_R| ~ sin(angle) between R and R_d; zero iff R == R_d."""
+    M = R_d.T @ R - R.T @ R_d
+    return 0.5 * jnp.array([M[2, 1], M[0, 2], M[1, 0]])
     
