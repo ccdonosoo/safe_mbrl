@@ -129,7 +129,10 @@ class HeapEnv(Env):
         # penalty see the filtered action a = alpha * a_plan + (1 - alpha) *
         # a_applied_prev, mirroring the deployment-side filter, so the planner
         # optimizes knowing its raw plan will be smoothed. 1.0 = no filter.
-        self._ema_alpha = getattr(cfg, "action_ema_alpha", 1.0) if cfg is not None else 1.0
+        # Scalar or per-joint (jd,) array; the branch flag is static for jit.
+        _ema = getattr(cfg, "action_ema_alpha", 1.0) if cfg is not None else 1.0
+        self._ema_alpha = jnp.broadcast_to(jnp.asarray(_ema, jnp.float32), (self._jd,))
+        self._use_ema = bool(jnp.any(self._ema_alpha < 1.0))
         # EE xyz of the joint reference, computed ONCE per reference window (jitted),
         # not per MPPI sample inside the rollout.
         self._ee_ref_fk = jax.jit(jax.vmap(self.fk.ee_pos))
@@ -197,7 +200,7 @@ class HeapEnv(Env):
         # Apply the modeled output EMA: from here on `action` is the APPLIED
         # action (what the machine would receive), and info["last_action"]
         # carries the filter memory through the rollout.
-        if self._ema_alpha < 1.0:
+        if self._use_ema:
             action = (self._ema_alpha * action
                       + (1.0 - self._ema_alpha) * state.info["last_action"])
 
