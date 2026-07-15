@@ -125,6 +125,12 @@ class HeapEnv(Env):
         scale = getattr(cfg, "q_cost_scale", None) if cfg is not None else None
         self._q_scale = (jnp.ones(self._jd) if scale is None
                          else jnp.asarray(scale, jnp.float32))
+        # Per-joint multipliers on the joint-space error (q AND qd terms), on
+        # top of the range normalization — emphasize joints whose tracking
+        # matters more (e.g. J_TURN). None -> equal weights.
+        w = getattr(cfg, "q_track_weight", None) if cfg is not None else None
+        self._q_w = (jnp.ones(self._jd) if w is None
+                     else jnp.asarray(w, jnp.float32))
         # Output EMA modeled INSIDE the rollout: the dynamics and the rate
         # penalty see the filtered action a = alpha * a_plan + (1 - alpha) *
         # a_applied_prev, mirroring the deployment-side filter, so the planner
@@ -223,11 +229,12 @@ class HeapEnv(Env):
     def _track_reward(self, rs: RobotState, info, i) -> jax.Array:
         """Reward for tracking THIS rollout step's reference (OOB index clamps to last).
         Two modes, selected by self._track_mode:
-          "joint" -> -joint_weight ||(q - q_ref) / s||^2 - ee_weight ||ee_xyz - ee_xyz_ref||^2
-                     (- qd_coef ||(qd - qd_ref) / s||^2 if a qd ref is given), with s the
-                     per-joint q_cost_scale (safe range) so all joints weigh equally in
-                     RELATIVE terms. The EE xyz term (mjx FK of q vs FK of q_ref) is
-                     active when ee_weight > 0.
+          "joint" -> -joint_weight sum(w ((q - q_ref) / s)^2) - ee_weight ||ee_xyz - ee_xyz_ref||^2
+                     (- qd_coef sum(w ((qd - qd_ref) / s)^2) if a qd ref is given), with s
+                     the per-joint q_cost_scale (safe range) so all joints weigh equally
+                     in RELATIVE terms, and w the per-joint q_track_weight multipliers
+                     (emphasize e.g. J_TURN; default ones). The EE xyz term (mjx FK of q
+                     vs FK of q_ref) is active when ee_weight > 0.
           "pose"  -> EE TF error: -||pos - pos_ref||^2 (- rot_coef ||e_R||^2 when the
                      reference is a full (4,4) homogeneous transform; a (3,) reference is
                      position-only for back-compat) (- twist_coef ||twist - twist_ref||^2
@@ -235,10 +242,10 @@ class HeapEnv(Env):
         """
         if self._track_mode == "joint":
             q_err = (rs.get_q() - info["q_target_seq"][i]) / self._q_scale
-            reward = -self._joint_weight * jnp.sum(q_err ** 2)
+            reward = -self._joint_weight * jnp.sum(self._q_w * q_err ** 2)
             if "qd_target_seq" in info:
                 qd_err = (rs.get_qd() - info["qd_target_seq"][i]) / self._q_scale
-                reward = reward - self._qd_coef * jnp.sum(qd_err ** 2)
+                reward = reward - self._qd_coef * jnp.sum(self._q_w * qd_err ** 2)
             if "ee_target_seq" in info:
                 reward = reward - self._ee_weight * jnp.sum(
                     (self.fk.ee_pos(rs.get_q()) - info["ee_target_seq"][i]) ** 2)
