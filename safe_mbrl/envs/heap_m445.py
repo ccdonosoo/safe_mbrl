@@ -110,8 +110,30 @@ class HeapEnv(Env):
         self._action_coef = getattr(cfg, "action_penalty_coef", 0.0) if cfg is not None else 0.1
         self._twist_coef = getattr(cfg, "twist_coef", 1.0) if cfg is not None else 1.0   # exact-twist tracking
         # Tracking mode: "pose" -> task-space TF (position + rotation) + optional twist;
-        # "joint" -> joint position + optional joint velocity. Selected via cfg.track_mode.
+        # "joint" -> joint position + optional joint velocity;
+        # "mpcc"  -> projection-variant MPC contouring over the FULL path
+        #            (time-decoupled; see _mpcc_reward). Selected via cfg.track_mode.
         self._track_mode = getattr(cfg, "track_mode", "joint") if cfg is not None else "joint"
+        if self._track_mode == "mpcc":
+            m = getattr(cfg, "mpcc", None)
+            if m is None or getattr(m, "qd_limit", None) is None:
+                raise ValueError(
+                    "track_mode 'mpcc' needs cfg.mpcc with a per-joint qd_limit "
+                    "(the soft velocity cap) — add the mpcc: section to the YAML")
+            qd_lim = jnp.asarray(m.qd_limit, jnp.float32)
+            if qd_lim.shape != (self._jd,):
+                raise ValueError(
+                    f"mpcc.qd_limit needs {self._jd} entries, got {list(m.qd_limit)}")
+            self._mpcc_w_ee = float(m.w_ee)
+            self._mpcc_w_q = float(m.w_q)
+            self._mpcc_delta = int(m.delta_max)
+            self._mpcc_rho = float(m.rho)
+            self._mpcc_sigma = float(m.sigma)
+            self._mpcc_qd_lim = qd_lim
+            self._mpcc_qd_lim_coef = float(m.qd_limit_coef)
+            self._mpcc_ee_accel_coef = float(m.ee_accel_coef)
+        # Velocity damping / joint-accel penalties (mpcc mode; 0 = disabled).
+        self._accel_coef = getattr(cfg, "accel_penalty_coef", 0.0) if cfg is not None else 0.0
         self._rot_coef = getattr(cfg, "rot_coef", 1.0) if cfg is not None else 1.0        # attitude tracking
         self._qd_coef = getattr(cfg, "qd_coef", 0.1) if cfg is not None else 1.0          # joint-velocity tracking
         # Combined joint-mode loss: joint_weight * ||q - q_ref||^2 + ee_weight *
@@ -155,7 +177,12 @@ class HeapEnv(Env):
 
         info = {"last_action": jnp.zeros(self._jd),
                 "step": jnp.zeros((), jnp.int32), "params": self._params}
-        if self._track_mode == "joint":
+        if self._track_mode == "mpcc":
+            # Degenerate 1-point path (reset is not used by the deployment
+            # runners; this keeps obs shapes/introspection working).
+            info.update(self._mpcc_path_info(
+                q_target[None, :], self.fk.ee_pos(q_target)[None], 0))
+        elif self._track_mode == "joint":
             info["q_target_seq"] = q_target[None, :]                      # (1, jd)
             if self._ee_weight > 0.0:
                 info["ee_target_seq"] = self.fk.ee_pos(q_target)[None]    # (1, 3)
@@ -167,13 +194,36 @@ class HeapEnv(Env):
 
         return State(rs, self._get_obs(rs, info), z, z, {"reward": z}, info)
     
+    def _mpcc_path_info(self, q_path, ee_path, path_idx):
+        """MPCC info entries: paths padded with delta_max copies of the last
+        point, so the projection window (dynamic_slice at theta of static size
+        delta_max + 1) never clamps its start — clamping would let the window
+        slide BACKWARD near the path end and break monotonicity. At the end
+        theta stalls on the last real index (argmin ties -> first occurrence),
+        progress stops paying, and the contour term holds the endpoint."""
+        q_path = jnp.asarray(q_path, jnp.float32)                     # (T, jd)
+        ee_path = jnp.asarray(ee_path, jnp.float32)                   # (T, 3)
+        pad = self._mpcc_delta
+        return {
+            "q_path": jnp.concatenate([q_path, jnp.tile(q_path[-1:], (pad, 1))]),
+            "ee_path": jnp.concatenate([ee_path, jnp.tile(ee_path[-1:], (pad, 1))]),
+            "path_idx": jnp.asarray(path_idx, jnp.int32),
+            "ee_prev": jnp.zeros(3),      # never read before step >= 2 (gated)
+            "ee_prev2": jnp.zeros(3),
+        }
+
     def make_traj_state(self, q_buf, qd_buf, act_buf, target_seq, jd, aux_seq=None,
-                        last_action=None):
+                        last_action=None, path_idx=0):
         # Important method for real world deployment -> here we just set the inputs from the
         # Real world, as q_buf, qd_buf, and act_buf, and the reference window `target_seq`.
         # `target_seq`/`aux_seq` follow the env's track_mode:
         #   "pose"  -> target_seq = EE pose seq (T,4,4) or position seq (T,3); aux_seq = twist (T,6)
         #   "joint" -> target_seq = joint-pos seq (T,jd);                      aux_seq = joint-vel (T,jd)
+        #   "mpcc"  -> target_seq = FULL joint path (T,jd) — not a window —
+        #              aux_seq = its EE positions (T,3) precomputed once per
+        #              trajectory; path_idx = theta_0, the UNCONSTRAINED
+        #              joint-space projection of q_now (a mid-path replan must
+        #              not catch up from index 0 through the monotone window).
         # `last_action` anchors the action-rate penalty of the FIRST rollout step to
         # the command actually applied last tick (None -> zeros, legacy behavior).
 
@@ -186,7 +236,11 @@ class HeapEnv(Env):
                                 else jnp.asarray(last_action)),
                 "step": jnp.zeros((), jnp.int32),
                 "params": self._params}
-        if self._track_mode == "joint":
+        if self._track_mode == "mpcc":
+            if aux_seq is None:
+                raise ValueError("mpcc mode needs aux_seq = EE positions of the path")
+            info.update(self._mpcc_path_info(target_seq, aux_seq, path_idx))
+        elif self._track_mode == "joint":
             info["q_target_seq"] = jnp.asarray(target_seq)
             if aux_seq is not None:
                 info["qd_target_seq"] = jnp.asarray(aux_seq)
@@ -218,13 +272,75 @@ class HeapEnv(Env):
         i = state.info["step"]
         # tracking reward + action-rate penalty over the rollout (mirrors the sim's
         # smoothness term) -> rewards smooth, low-jitter action sequences while planning.
-        reward = self._track_reward(rs, state.info, i) \
+        if self._track_mode == "mpcc":
+            reward, mpcc_updates = self._mpcc_reward(rs, state.info)
+        else:
+            reward, mpcc_updates = self._track_reward(rs, state.info, i), {}
+        reward = reward \
             - self._action_coef * jnp.sum((action - state.info["last_action"]) ** 2)
-        info = {**state.info, "last_action": action, "step": i + 1}
+        info = {**state.info, "last_action": action, "step": i + 1, **mpcc_updates}
         return State(rs, self._get_obs(rs, info), reward, jnp.zeros(()), state.metrics, info)
 
     # kept for API compatibility (non-jit callers); identical semantics to step().
     step_general = step
+
+    def _mpcc_reward(self, rs: RobotState, info):
+        """Projection-variant MPCC step reward -> (reward, info updates).
+
+        theta (info["path_idx"]) is DERIVED, never optimized: the windowed
+        argmin of the weighted contour metric
+            d_i = w_ee ||p - p_path_i||^2 + w_q ||q - q_path_i||^2
+        over [theta, theta + delta_max] — monotone (never slides backward)
+        and rate-bounded (delta_max caps the rewarded path speed). Each MPPI
+        sample carries its own theta / EE history through info. Reward:
+            -c^2                          contouring (c^2 = d at the projection)
+            + rho * dtheta * exp(-c^2/sigma^2)   proximity-gated progress:
+                                          off the path the ONLY way to improve
+                                          is to return — corner-cutting cannot
+                                          buy progress (quasi-lexicographic)
+            - qd_limit hinge              per-joint soft speed limit
+            - ee_accel                    2nd-order-FD EE smoothness (task
+                                          space: J(q) qd amplifies at reach,
+                                          joint smoothness does not imply EE
+                                          smoothness); gated for step < 2
+            - qd damping / joint accel    optional (qd_coef / accel_penalty_coef)
+        The action-rate term stays in step() (shared with the other modes).
+        The exact projection is nonsmooth — MPPI only evaluates rollouts, so
+        this variant is incompatible with derivative-based solvers.
+        """
+        q, qd = rs.get_q(), rs.get_qd()
+        p = self.fk.ee_pos(q)                       # shared by contour + smoothness
+        th_prev = info["path_idx"]
+        w = self._mpcc_delta + 1
+        q_win = jax.lax.dynamic_slice(info["q_path"], (th_prev, 0), (w, self._jd))
+        p_win = jax.lax.dynamic_slice(info["ee_path"], (th_prev, 0), (w, 3))
+        d = (self._mpcc_w_ee * jnp.sum((p - p_win) ** 2, axis=-1)
+             + self._mpcc_w_q * jnp.sum((q - q_win) ** 2, axis=-1))
+        off = jnp.argmin(d)
+        c2 = d[off]
+        n_path = info["q_path"].shape[0] - self._mpcc_delta          # T (static)
+        # Clamp to the last REAL index: without it theta drifts into the pad
+        # and the padded copies would pay up to delta_max of bogus progress.
+        theta = jnp.minimum(th_prev + off, n_path - 1)
+        dtheta = (theta - th_prev).astype(jnp.float32) / n_path
+
+        reward = -c2 + self._mpcc_rho * dtheta * jnp.exp(-c2 / self._mpcc_sigma ** 2)
+
+        over = jnp.maximum(0.0, jnp.abs(qd) - self._mpcc_qd_lim)
+        reward = reward - self._mpcc_qd_lim_coef * jnp.sum(over ** 2)
+
+        ee_acc = (p - 2.0 * info["ee_prev"] + info["ee_prev2"]) / self._dt ** 2
+        reward = reward - jnp.where(
+            info["step"] >= 2,                       # no EE history before that
+            self._mpcc_ee_accel_coef * jnp.sum(ee_acc ** 2), 0.0)
+
+        if self._qd_coef > 0.0:                      # velocity damping (off by default)
+            reward = reward - self._qd_coef * jnp.sum(qd ** 2)
+        if self._accel_coef > 0.0:                   # joint accel (off by default)
+            qd_prev = rs.qd_buffer[-2 * self._jd:-self._jd]
+            reward = reward - self._accel_coef * jnp.sum(((qd - qd_prev) / self._dt) ** 2)
+
+        return reward, {"path_idx": theta, "ee_prev": p, "ee_prev2": info["ee_prev"]}
 
     def _track_reward(self, rs: RobotState, info, i) -> jax.Array:
         """Reward for tracking THIS rollout step's reference (OOB index clamps to last).
@@ -265,7 +381,11 @@ class HeapEnv(Env):
 
     def _get_obs(self, rs: RobotState, info) -> jax.Array:
         parts = [rs.ravel()]
-        if self._track_mode == "joint":
+        if self._track_mode == "mpcc":
+            # The learned dynamics read the raw buffers, not obs; append the
+            # current projection's path point so obs stays well-defined.
+            parts.append(info["q_path"][info["path_idx"]])
+        elif self._track_mode == "joint":
             parts.append(info["q_target_seq"][0])
             if "qd_target_seq" in info:
                 parts.append(info["qd_target_seq"][0])
