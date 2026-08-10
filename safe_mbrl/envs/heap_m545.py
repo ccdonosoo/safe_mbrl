@@ -1,9 +1,4 @@
-"""Minimal HeapEnv for the M545 arm.
-
-Dynamics come from a learned RobotEnsemble (JAX); the end-effector position is
-computed with mjx forward kinematics (same URDF as the torch HeapEnv), and the
-step reward mirrors heap_example_env: end-effector tracking + an action penalty.
-"""
+"""Minimal HeapEnv for the M545 arm: learned RobotEnsemble dynamics + mjx FK."""
 import os
 import xml.etree.ElementTree as ET
 
@@ -22,7 +17,7 @@ file_path = os.path.dirname(os.path.abspath(__file__))
 URDF_PATH = os.path.join(file_path, "heap_env/rsc/m545/m545_boom_dipper_tele_pitch.urdf")
 EE_BODY, ROOT_BODY = "ENDEFFECTOR_CONTACT", "CABIN"
 
-# Reachable joint range the actuator-net plant (MenziActNet.pos_limit, order boom, dipper, tele, pitch). Reset samples reachable
+# MenziActNet.pos_limit, order boom, dipper, tele, pitch
 POS_LIMIT = jnp.array([[-1.2, -0.5], [0.58, 1.5708], [0.0, 0.2], [0.0, 1.5708]])
 
 
@@ -36,19 +31,13 @@ def _quat2mat(q):
 
 
 def _so3_error(R, R_d):
-    """SO(3) attitude error vector e_R = 0.5 * vee(R_d^T R - R^T R_d) (Lee et al.,
-    geometric tracking). |e_R| ~ sin(angle) between R and R_d; zero iff R == R_d."""
+    """e_R = 0.5 * vee(R_d^T R - R^T R_d)."""
     M = R_d.T @ R - R.T @ R_d
     return 0.5 * jnp.array([M[2, 1], M[0, 2], M[1, 0]])
 
 
 class M545FK:
-    """mjx forward kinematics: joint vector -> EE position in the CABIN frame.
-
-    The URDF has .dae meshes mujoco can't read, so visual/collision geoms are
-    stripped; `fusestatic=false` keeps the CABIN / ENDEFFECTOR_CONTACT frames
-    (mujoco otherwise welds fixed-joint bodies away).
-    """
+    """mjx FK: joint vector -> EE pose in the CABIN frame."""
 
     def __init__(self, urdf_path=URDF_PATH):
         root = ET.parse(urdf_path).getroot()
@@ -103,12 +92,16 @@ class HeapEnv(Env):
         self._mode = model.mode
         self._dt = model._dt
         self._action_coef = getattr(cfg, "action_penalty_coef", 0.0) if cfg is not None else 0.1
-        self._twist_coef = getattr(cfg, "twist_coef", 1.0) if cfg is not None else 1.0   # exact-twist tracking
-        # Tracking mode: "pose" -> task-space TF (position + rotation) + optional twist;
-        # "joint" -> joint position + optional joint velocity. Selected via cfg.track_mode.
+        self._twist_coef = getattr(cfg, "twist_coef", 1.0) if cfg is not None else 1.0
         self._track_mode = getattr(cfg, "track_mode", "joint") if cfg is not None else "joint"
-        self._rot_coef = getattr(cfg, "rot_coef", 1.0) if cfg is not None else 1.0        # attitude tracking
-        self._qd_coef = getattr(cfg, "qd_coef", 0.1) if cfg is not None else 1.0          # joint-velocity tracking
+        self._rot_coef = getattr(cfg, "rot_coef", 1.0) if cfg is not None else 1.0
+        self._qd_coef = getattr(cfg, "qd_coef", 0.1) if cfg is not None else 1.0
+        self._joint_weight = getattr(cfg, "joint_weight", 1.0) if cfg is not None else 1.0
+        self._ee_weight = getattr(cfg, "ee_weight", 0.0) if cfg is not None else 0.0
+        _ema = getattr(cfg, "action_ema_alpha", 1.0) if cfg is not None else 1.0
+        self._ema_alpha = jnp.broadcast_to(jnp.asarray(_ema, jnp.float32), (self._jd,))
+        self._use_ema = bool(jnp.any(self._ema_alpha < 1.0))
+        self._ee_ref_fk = jax.jit(jax.vmap(self.fk.ee_pos))
         self._graphdef, self._params = nnx.split(model.model)
 
     def reset(self, rng: jax.Array) -> State:
@@ -124,6 +117,8 @@ class HeapEnv(Env):
                 "step": jnp.zeros((), jnp.int32), "params": self._params}
         if self._track_mode == "joint":
             info["q_target_seq"] = q_target[None, :]                      # (1, jd)
+            if self._ee_weight > 0.0:
+                info["ee_target_seq"] = self.fk.ee_pos(q_target)[None]    # (1, 3)
         else:
             pos, R = self.fk.ee_pose(q_target)                           # CABIN-frame target pose
             info["ee_target_seq"] = jnp.eye(4).at[:3, :3].set(R).at[:3, 3].set(pos)[None]   # (1, 4, 4)
@@ -132,25 +127,23 @@ class HeapEnv(Env):
 
         return State(rs, self._get_obs(rs, info), z, z, {"reward": z}, info)
     
-    def make_traj_state(self, q_buf, qd_buf, act_buf, target_seq, jd, aux_seq=None):
-        # Important method for real world deployment -> here we just set the inputs from the
-        # Real world, as q_buf, qd_buf, and act_buf, and the reference window `target_seq`.
-        # `target_seq`/`aux_seq` follow the env's track_mode:
-        #   "pose"  -> target_seq = EE pose seq (T,4,4) or position seq (T,3); aux_seq = twist (T,6)
-        #   "joint" -> target_seq = joint-pos seq (T,jd);                      aux_seq = joint-vel (T,jd)
-
+    def make_traj_state(self, q_buf, qd_buf, act_buf, target_seq, jd, aux_seq=None,
+                        last_action=None):
         rs = RobotState(q_buffer=jnp.asarray(q_buf),
                         qd_buffer=jnp.asarray(qd_buf),
                         act_buffer=jnp.asarray(act_buf),
                         q_dim=jd)
 
-        info = {"last_action": jnp.zeros(jd),
+        info = {"last_action": (jnp.zeros(jd) if last_action is None
+                                else jnp.asarray(last_action)),
                 "step": jnp.zeros((), jnp.int32),
                 "params": self._params}
         if self._track_mode == "joint":
             info["q_target_seq"] = jnp.asarray(target_seq)
             if aux_seq is not None:
                 info["qd_target_seq"] = jnp.asarray(aux_seq)
+            if self._ee_weight > 0.0:
+                info["ee_target_seq"] = self._ee_ref_fk(jnp.asarray(target_seq))
         else:
             info["ee_target_seq"] = jnp.asarray(target_seq)
             if aux_seq is not None:
@@ -162,14 +155,14 @@ class HeapEnv(Env):
 
     def step(self, state: State, action: jax.Array) -> State:
         action = jnp.clip(action, -1.0, 1.0)
+        if self._use_ema:
+            action = (self._ema_alpha * action
+                      + (1.0 - self._ema_alpha) * state.info["last_action"])
 
-        # merge a fresh ensemble from the carried params, then advance one BPTT-consistent step
         ens = nnx.merge(self._graphdef, state.info["params"])
         rs = _model_step(ens, state.pipeline_state, action, self._jd, self._mode, self._dt)
 
         i = state.info["step"]
-        # tracking reward + action-rate penalty over the rollout (mirrors the sim's
-        # smoothness term) -> rewards smooth, low-jitter action sequences while planning.
         reward = self._track_reward(rs, state.info, i) \
             - self._action_coef * jnp.sum((action - state.info["last_action"]) ** 2)
         info = {**state.info, "last_action": action, "step": i + 1}
@@ -179,18 +172,13 @@ class HeapEnv(Env):
     step_general = step
 
     def _track_reward(self, rs: RobotState, info, i) -> jax.Array:
-        """Reward for tracking THIS rollout step's reference (OOB index clamps to last).
-        Two modes, selected by self._track_mode:
-          "joint" -> -||q - q_ref||^2 (- qd_coef ||qd - qd_ref||^2 if a qd ref is given)
-          "pose"  -> EE TF error: -||pos - pos_ref||^2 (- rot_coef ||e_R||^2 when the
-                     reference is a full (4,4) homogeneous transform; a (3,) reference is
-                     position-only for back-compat) (- twist_coef ||twist - twist_ref||^2
-                     when a twist ref is given). EE comes from the differentiable mjx FK.
-        """
         if self._track_mode == "joint":
-            reward = -jnp.sum((rs.get_q() - info["q_target_seq"][i]) ** 2)
+            reward = -self._joint_weight * jnp.sum((rs.get_q() - info["q_target_seq"][i]) ** 2)
             if "qd_target_seq" in info:
                 reward = reward - self._qd_coef * jnp.sum((rs.get_qd() - info["qd_target_seq"][i]) ** 2)
+            if "ee_target_seq" in info:
+                reward = reward - self._ee_weight * jnp.sum(
+                    (self.fk.ee_pos(rs.get_q()) - info["ee_target_seq"][i]) ** 2)
             return reward
 
         target = info["ee_target_seq"][i]

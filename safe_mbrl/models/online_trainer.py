@@ -65,20 +65,29 @@ class OnlineTrainer:
             optimizer.update(ens, grads)
             return loss
 
-        best_mse, best_state, patience = float("inf"), nnx.state(ens, nnx.Param), 0
+        # No val data -> train on everything, keep the LAST epoch, return its train NLL.
+        use_val = self._val_dataset is not None and len(self._val_dataset) > 0
+        best_mse, best_state, patience = float("inf"), None, 0
         n_batches = max(1, sum(len(d) for d in self._train_dataset) // self._batch_size)
 
+        train_loss = float("nan")
         for epoch in range(self.epoch, self.epoch + self._nb_epochs):
             self.epoch = epoch
             train_losses = []
             for _ in range(n_batches):
                 key, states, actions = sample_rollout_datasets(self._train_dataset, H, self._batch_size, key, jd, bd)
                 train_losses.append(np.asarray(train_step(ens, optimizer, states, actions)))
+            train_loss = float(np.mean(train_losses))
+
+            if not use_val:
+                if verbose:
+                    print(f"Epoch {epoch}: train_nll {train_loss:.6e}")
+                self.log_training(train_loss, float("nan"))
+                continue
 
             rng, vs, va = sample_rollout_datasets(self._val_dataset, Hv, val_samples, rng, jd, bd)
             val_nll = float(mean_rollout(rollout_loss, ens, vs, va, Hv))
             val_mse = float(mean_rollout(rollout_loss_mse, ens, vs, va, Hv))
-            train_loss = float(np.mean(train_losses))
 
             if verbose:
                 print(f"Epoch {epoch}: train_nll {train_loss:.6e}, val_nll {val_nll:.6e}, val_mse {val_mse:.6e}")
@@ -91,8 +100,9 @@ class OnlineTrainer:
                 if patience > self._early_stopping_patience:
                     break
 
-        # Restore the best params into the live model in place.
-        nnx.update(ens, best_state)
+        if not use_val:
+            return train_loss
+        nnx.update(ens, best_state)   # restore best-epoch params
         return best_mse
 
 
