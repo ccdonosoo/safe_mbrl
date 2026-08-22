@@ -2,6 +2,7 @@ import torch
 import numpy as np
 
 import pytorch_kinematics as pk
+from pytorch_kinematics.transforms.so3 import so3_log_map
 
 import os, sys
 file_path = os.path.dirname(os.path.abspath(__file__))
@@ -101,6 +102,8 @@ class HeapEnv(gym.Env):
     self.target_trajectories = []
     self.target_joint_pos_histories = []
 
+    self.info = {}
+
   def sample_ref_traj(self, start_q: None | torch.Tensor = None):
     """
       Generates a sample reference trajectory for the environment.
@@ -135,7 +138,8 @@ class HeapEnv(gym.Env):
     self.ref_traj_joint = torch.einsum('ijk,j->ijk', self.ref_traj_joint_01, self.actnet.pos_limit[:, 1] - self.actnet.pos_limit[:, 0]) + self.actnet.pos_limit[:, 0].unsqueeze(0).unsqueeze(-1).repeat(self.n_envs, 1, self.ref_traj_steps).contiguous()
     self.ref_traj_Tee = self.kinematics.forward_kinematics(self.ref_traj_joint.transpose(1,2).reshape(self.n_envs*self.ref_traj_steps, -1)).get_matrix().reshape(self.n_envs, self.ref_traj_steps, 4, 4)
     self.ref_traj_eepos = self.ref_traj_Tee[:, :, :3, 3]
-  
+    self.ref_traj_eerot = self.ref_traj_Tee[:, :, :3, :3]
+
   def reset(self, seed=None, options=None, start_q=None, reset_model: bool = True):
     """
       Resets the environment to an initial state.
@@ -164,6 +168,7 @@ class HeapEnv(gym.Env):
     self.accel = (self.ee_vel - torch.zeros_like(self.ee_vel)) / self.t_step
     self.current_step = 0
     self.action = torch.zeros(self.n_envs, self.act_dim, device=self.device)
+    self.last_action = self.action.clone()
     return self._get_obs(), self._get_info()
 
   def step(self, action):
@@ -192,6 +197,7 @@ class HeapEnv(gym.Env):
     self.dof_pos_history = torch.cat([pos_joint.unsqueeze(-1), self.dof_pos_history[:, :, :-1]], dim=-1)
     self.dof_vel_history = torch.cat([vel_joint.unsqueeze(-1), self.dof_vel_history[:, :, :-1]], dim=-1)
     self.ee_pos = self.kinematics.forward_kinematics(pos_joint).get_matrix()[:, :3, 3]
+    self.ee_rot = self.kinematics.forward_kinematics(pos_joint).get_matrix()[:, :3, :3]
     self.ee_vel = self.kinematics.jacobian(pos_joint).matmul(vel_joint.unsqueeze(-1)).squeeze(-1)
     self.accel = (self.ee_vel - self.last_ee_vel) / self.t_step
     self.current_step += 1
@@ -236,6 +242,8 @@ class HeapEnv(gym.Env):
       Generates and returns a dictionary containing the current information of the environment.
     """
     info = {}
+    if getattr(self, 'info', None) is not None:
+      info.update(self.info)
     return info
 
   def _compute_reward(self):
@@ -255,6 +263,20 @@ class HeapEnv(gym.Env):
     """
     reward = torch.zeros((self.n_envs), device=self.device, dtype=torch.float32)
     reward = -torch.sum((self.ee_pos - self.ref_traj_eepos[:, self.current_step])**2, dim=-1)
+    err_ee_pos = torch.norm(self.ee_pos - self.ref_traj_eepos[:, self.current_step], dim=-1).square()
+    err_ee_rot = torch.norm(so3_log_map(self.ee_rot @ self.ref_traj_eerot[:, self.current_step].transpose(1,2))).square()
+    traj_ref_vel = self.kinematics.jacobian(self.ref_traj_joint[:, :, self.current_step]).matmul((self.ref_traj_joint[:, :, min(self.current_step+1, self.ref_traj_steps-1)] - self.ref_traj_joint[:, :, max(self.current_step-1, 0)]).unsqueeze(-1) / (2*self.t_step)).squeeze(-1)
+    err_ee_vel = torch.norm(self.ee_vel - traj_ref_vel, dim=-1).square()
+    err_j_pos = torch.norm(self.dof_pos_history[:,:,0] - self.ref_traj_joint[:,:,self.current_step], dim=-1).square()
+    err_j_vel = torch.norm(self.dof_vel_history[:,:,0], dim=-1).square()
+
+    self.info['err_terms'] = {
+      'err_ee_pos': err_ee_pos.mean().item(),
+      'err_ee_rot': err_ee_rot.mean().item(),
+      'err_ee_vel': err_ee_vel.mean().item(),
+      'err_j_pos': err_j_pos.mean().item(),
+      'err_j_vel': err_j_vel.mean().item()}
+
     # TODO: How to set up the reward function?
     # The main objective we consider first is endeffector tracking
     # Let's keep it simple for now, maybe add small regularization when necessary

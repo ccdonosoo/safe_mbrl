@@ -3,3 +3,5 @@ __pycache__/
 *.png
 *.npz
 imgui.ini
+logs/
+precision_at_speed_data*

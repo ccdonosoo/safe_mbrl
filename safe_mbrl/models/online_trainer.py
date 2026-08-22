@@ -43,7 +43,8 @@ class OnlineTrainer:
         self._logger.scalar_summary("train/train_loss", loss_train, self.epoch)
         self._logger.scalar_summary("train/val_loss", loss_val, self.epoch)
 
-    def train_model_bptt(self, seed: int = 0, verbose: bool = True, val_samples: int = 100):
+    def train_model_bptt(self, seed: int = 0, verbose: bool = True, val_samples: int = 100,
+                         train_concat: Dataset = None):
         key = jax.random.key(seed)
         rng, key = jax.random.split(key)
         jd, bd = self.model.joint_dim, self.model.buffer_dim
@@ -75,7 +76,8 @@ class OnlineTrainer:
             self.epoch = epoch
             train_losses = []
             for _ in range(n_batches):
-                key, states, actions = sample_rollout_datasets(self._train_dataset, H, self._batch_size, key, jd, bd)
+                key, states, actions = sample_rollout_datasets(self._train_dataset, H, self._batch_size, key, jd, bd,
+                                                               concat=train_concat)
                 train_losses.append(np.asarray(train_step(ens, optimizer, states, actions)))
             train_loss = float(np.mean(train_losses))
 
@@ -104,6 +106,100 @@ class OnlineTrainer:
             return train_loss
         nnx.update(ens, best_state)   # restore best-epoch params
         return best_mse
+
+    def _make_fused_step(self):
+        """One nnx.jit'ed call fusing batch sampling + gradient step. Sampling key
+        stream and update math are identical to sample_rollout_datasets + train_step
+        in train_model_bptt; only the dispatch granularity changes."""
+        jd, bd = self.model.joint_dim, self.model.buffer_dim
+        mode, dt, gamma = self.model.mode, self.model._dt, self._gamma
+        H, BS = self._horizon, self._batch_size
+        idx = getattr(self.model, "_input_idx", None)
+        H1 = H + 1
+
+        @nnx.jit
+        def fused(ens, optimizer, key, data_input, lengths, offsets, pmf):
+            key, rng = jax.random.split(key)
+            didx = jax.random.choice(rng, jnp.arange(lengths.shape[0]), shape=(BS,), p=pmf)
+            keys = jax.random.split(rng, BS)
+            local = jax.vmap(lambda d, k: jax.random.randint(k, (), 0, lengths[d] - H1))(didx, keys)
+            starts = offsets[didx] + local
+
+            def sample(start):
+                inp = jax.lax.dynamic_slice_in_dim(data_input, start, H1, axis=0)
+                state = jax.vmap(lambda x: _input_to_state(x, jd, bd))(inp)
+                return state, state.act_buffer[:, -jd:]
+
+            states, actions = jax.vmap(sample)(starts)
+
+            def mean_rollout(e):
+                f = lambda e_, s, a: rollout_loss(e_, s, a, jd, mode, dt, gamma, H, input_idx=idx)
+                return jnp.mean(nnx.vmap(f, in_axes=(None, 0, 0))(e, states, actions))
+
+            def mean_rollout_mse(e):
+                f = lambda e_, s, a: rollout_loss_mse(e_, s, a, jd, mode, dt, gamma, H, input_idx=idx)
+                return jnp.mean(nnx.vmap(f, in_axes=(None, 0, 0))(e, states, actions))
+
+            def one_step_vel_mse(e):
+                # one-step velocity prediction MSE [rad^2/s^2]: the quantity the
+                # online_learning_control baseline logs as "Model Err"
+                def single(e_, s, a):
+                    s0 = s.take(0)
+                    mu, _ = jnp.split(e_(_featurize(s0, idx)), 2, axis=-1)
+                    if mu.ndim > 1:                      # PE: (num_ensembles, jd)
+                        mu = jnp.mean(mu, axis=0)
+                    pred_qd = s0.get_qd() + mu if mode == "dv" else mu
+                    return jnp.mean((pred_qd - s.qd_buffer[1, -jd:]) ** 2)
+                return jnp.mean(nnx.vmap(single, in_axes=(None, 0, 0))(e, states, actions))
+
+            loss, grads = nnx.value_and_grad(mean_rollout)(ens)
+            mse = mean_rollout_mse(ens)                  # pre-update params, same batch
+            mse_vel = one_step_vel_mse(ens)
+            optimizer.update(ens, grads)
+            return key, loss, mse, mse_vel
+
+        return fused
+
+    def train_model_bptt_jit(self, seed: int = 0, verbose: bool = True, train_concat: Dataset = None):
+        """Fused-jit variant of train_model_bptt for the no-validation path: same
+        sampling distribution, key stream, and optimizer behavior (fresh optimizer
+        state per call), with sampling + gradient step compiled into one dispatch.
+
+        Returns {"nll", "mse", "mse_vel"}: the Gaussian NLL that is optimized, the
+        discounted H-step joint-position MSE, and the one-step velocity MSE, all
+        averaged over the last epoch's batches (identical windows, pre-update params).
+        The extra metrics are diagnostics only - they do not affect the update."""
+        key = jax.random.key(seed)
+        rng, key = jax.random.split(key)
+
+        ens = self.model.model
+        optimizer = nnx.Optimizer(ens, self._tx, wrt=nnx.Param)
+        if getattr(self, "_fused_step", None) is None:
+            self._fused_step = self._make_fused_step()
+
+        lengths_np = np.array([len(d) for d in self._train_dataset], dtype=np.int64)
+        lengths = jnp.asarray(lengths_np, dtype=jnp.int32)
+        pmf = lengths / jnp.sum(lengths)
+        offsets = jnp.concatenate([jnp.array([0], jnp.int32), jnp.cumsum(lengths)[:-1]])
+        data = Dataset.concatenate(*self._train_dataset) if train_concat is None else train_concat
+
+        n_batches = max(1, int(lengths_np.sum()) // self._batch_size)
+        train_loss = float("nan")
+        for epoch in range(self.epoch, self.epoch + self._nb_epochs):
+            self.epoch = epoch
+            losses, mses, mses_vel = [], [], []
+            for _ in range(n_batches):
+                key, loss, mse, mse_vel = self._fused_step(
+                    ens, optimizer, key, data.input, lengths, offsets, pmf)
+                losses.append(loss); mses.append(mse); mses_vel.append(mse_vel)
+            train_loss = float(np.mean(np.asarray(jnp.stack(losses))))
+            train_mse = float(np.mean(np.asarray(jnp.stack(mses))))
+            train_mse_vel = float(np.mean(np.asarray(jnp.stack(mses_vel))))
+            if verbose:
+                print(f"Epoch {epoch}: train_nll {train_loss:.6e}, "
+                      f"train_mse {train_mse:.6e}, train_mse_vel {train_mse_vel:.6e}")
+            self.log_training(train_loss, float("nan"))
+        return {"nll": train_loss, "mse": train_mse, "mse_vel": train_mse_vel}
 
 
 
@@ -171,9 +267,12 @@ def _input_to_state(x, joint_dim, buffer_dim):
     return RobotState(q_buffer=x[:n], qd_buffer=x[n:2 * n], act_buffer=x[2 * n:], q_dim=joint_dim)
 
 
-def sample_rollout_datasets(datasets: Sequence, horizon, num_rollouts, key, joint_dim, buffer_dim):
+def sample_rollout_datasets(datasets: Sequence, horizon, num_rollouts, key, joint_dim, buffer_dim,
+                            concat: Dataset = None):
     """Sample `num_rollouts` contiguous (horizon+1)-length windows, length-weighted
-    across datasets and never crossing a dataset boundary -> fixed-shape batch."""
+    across datasets and never crossing a dataset boundary -> fixed-shape batch.
+    `concat` may pass a precomputed Dataset.concatenate(*datasets) so callers can
+    hoist the concatenation out of a per-batch loop (identical sampling either way)."""
     H = horizon + 1
     lengths = jnp.array([len(d) for d in datasets], dtype=jnp.int32)
     pmf = lengths / jnp.sum(lengths)
@@ -185,7 +284,7 @@ def sample_rollout_datasets(datasets: Sequence, horizon, num_rollouts, key, join
     local = jax.vmap(lambda d, k: jax.random.randint(k, (), 0, lengths[d] - H))(didx, keys)
     starts = offsets[didx] + local
 
-    data = Dataset.concatenate(*datasets)
+    data = Dataset.concatenate(*datasets) if concat is None else concat
 
     def sample(start):
         inp = jax.lax.dynamic_slice_in_dim(data.input, start, H, axis=0)   # (H, 3*jd*bd)
