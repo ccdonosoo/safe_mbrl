@@ -86,15 +86,19 @@ def parse_args():
     p.add_argument("--bptt-horizon", type=int, default=10)
     # eval / output
     p.add_argument("--eval-every", type=int, default=5, help="rounds between evals; 0 disables")
+    # Fixed 3320-step reference trajectory (dict with ref_pos/ref_vel, (3320, 4) joint-space)
+    # shared by the TD-MPC2 / DreamerV3 / MBPO benchmark evals. Bundled in the repo, so the
+    # default works from a fresh clone; point --eval-traj elsewhere to eval on a different one.
     p.add_argument("--eval-traj",
-                   default="/home/fang/Applications/tmpenv/online_learning_control/ref_traj_eval.pt")
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "data", "ref_traj_eval.pt"))
     p.add_argument("--save-data", action=argparse.BooleanOptionalAction, default=True,
                    help="save every round's raw transitions to data/round_XXX.npy (~1.1 MB/round)")
     p.add_argument("--ckpt-every", type=int, default=1,
                    help="save ensemble params every N rounds (0 disables; ~2.3 MB each)")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", default="heap_td_mpc")
-    p.add_argument("--wandb-entity", default="fangnan")
+    p.add_argument("--wandb-entity", default="fangnan")   # only used with --wandb; set to your own entity
     return p.parse_args()
 
 

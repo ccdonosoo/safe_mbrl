@@ -6,6 +6,8 @@ cd "$(dirname "$0")/.."
 # /opt/openrobots (python3.8) on PYTHONPATH/LD_LIBRARY_PATH shadows the venv's pinocchio
 unset PYTHONPATH LD_LIBRARY_PATH
 PY=.venv/bin/python
+# Personal push-notification endpoint - replace with your own ntfy topic, or leave:
+# notify() degrades to a no-op if the URL is unreachable.
 NTFY_URL="https://ntfy.fangnan.me/work_rsl"
 mkdir -p logs/heap-eetracking
 
