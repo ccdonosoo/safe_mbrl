@@ -10,6 +10,9 @@ initial exploration rounds, or on a fixed late-training slice:
   python scripts/eval_heap_model.py --run ... --data-rounds 11-400 --cumulative
       # growing eval set: checkpoint i is scored on rounds 11..i, i.e. everything it has
       # been trained on so far except the initial exploration
+  python scripts/eval_heap_model.py --run ... --online
+      # prequential/test error: checkpoint i is scored ONLY on round i+1 - the data that
+      # was collected while planning with checkpoint i, which it has never trained on
 
 Writes <run>/model_eval.csv with: round, nll, mse (discounted H-step joint-position
 MSE), mse_vel (one-step velocity MSE, the MBPO "Model Err" definition), n_windows.
@@ -48,6 +51,8 @@ def main():
     p.add_argument("--ckpt-rounds", default=None, help="inclusive round range of checkpoints (default: all)")
     p.add_argument("--cumulative", action="store_true",
                    help="score checkpoint i on data rounds [start..i] instead of the fixed slice")
+    p.add_argument("--online", action="store_true",
+                   help="score checkpoint i on round i+1 only (the data collected while planning with it)")
     p.add_argument("--stride", type=int, default=8, help="window start stride within each 150-step episode")
     p.add_argument("--batch", type=int, default=4096, help="windows per jit call")
     p.add_argument("--out", default=None, help="output csv (default <run>/model_eval.csv)")
@@ -73,13 +78,15 @@ def main():
 
     # deterministic strided windows over every episode of the selected rounds,
     # kept in round order with cumulative bounds so --cumulative can slice prefixes
-    wins, bounds = [], {}
+    wins, bounds, spans = [], {}, {}
     for r in data_rounds:
         arr = np.load(os.path.join(args.run, "data", f"round_{r:03d}.npy"))  # (E, T, 3*jd*bd)
+        n0 = len(wins)
         for e in range(arr.shape[0]):
             for st in range(0, arr.shape[1] - (H + 1), args.stride):
                 wins.append(arr[e, st:st + H + 1])
         bounds[r] = len(wins)
+        spans[r] = (n0, len(wins))
     wins = np.asarray(wins, np.float32)
     n_total = len(wins)
     print(f"{n_total} windows from rounds {data_rounds[0]}-{data_rounds[-1]} "
@@ -107,25 +114,35 @@ def main():
         vm = lambda f: nnx.vmap(f, in_axes=(None, 0, 0))(ens, states, actions)
         return jnp.stack([jnp.sum(vm(f_nll) * w), jnp.sum(vm(f_mse) * w), jnp.sum(vm(f_vel) * w)])
 
-    out = args.out or os.path.join(args.run, "model_eval_cum.csv" if args.cumulative else "model_eval.csv")
+    out = args.out or os.path.join(args.run,
+                                   "model_eval_online.csv" if args.online
+                                   else "model_eval_cum.csv" if args.cumulative else "model_eval.csv")
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["round", "nll", "mse", "mse_vel", "n_windows", "data_rounds"])
         for r in ckpt_rounds:
-            if args.cumulative:
+            if args.online:
+                lo, hi = spans.get(r + 1, (0, 0))
+                n, tag = hi - lo, (f"{r + 1}" if hi > lo else "none")
+            elif args.cumulative:
                 past = [x for x in data_rounds if x <= r]
-                n = bounds[past[-1]] if past else 0
+                lo, hi = 0, (bounds[past[-1]] if past else 0)
+                n = hi
                 tag = f"{data_rounds[0]}-{past[-1]}" if past else "none"
             else:
-                n, tag = n_total, f"{data_rounds[0]}-{data_rounds[-1]}"
+                lo, hi, n = 0, n_total, n_total
+                tag = f"{data_rounds[0]}-{data_rounds[-1]}"
             if n == 0:
                 w.writerow([r, "nan", "nan", "nan", 0, tag]); f.flush()
                 continue
             params = pickle.load(open(os.path.join(args.run, "ckpt", f"params_{r:03d}.pkl"), "rb"))
             ens = nnx.merge(graphdef, jax.device_put(params))
             acc = np.zeros(3)
-            for i in range(0, n, B):
-                acc += np.asarray(jax.device_get(score(ens, wins_d[i:i + B], min(B, n - i))))
+            if args.online:                                  # one small constant-shape set per round
+                acc += np.asarray(jax.device_get(score(ens, wins_d[lo:hi], n)))
+            else:
+                for i in range(lo, hi, B):
+                    acc += np.asarray(jax.device_get(score(ens, wins_d[i:i + B], min(B, hi - i))))
             nll, mse, mse_vel = acc / n
             w.writerow([r, f"{nll:.6e}", f"{mse:.6e}", f"{mse_vel:.6e}", n, tag])
             f.flush()
