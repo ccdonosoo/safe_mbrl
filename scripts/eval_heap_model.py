@@ -7,6 +7,9 @@ initial exploration rounds, or on a fixed late-training slice:
   python scripts/eval_heap_model.py --run logs/heap-eetracking/tuned_full/1 \
       --data-rounds 11-400          # per-checkpoint MSE on all post-exploration data
   python scripts/eval_heap_model.py --run ... --data-rounds 390-400   # fixed late slice
+  python scripts/eval_heap_model.py --run ... --data-rounds 11-400 --cumulative
+      # growing eval set: checkpoint i is scored on rounds 11..i, i.e. everything it has
+      # been trained on so far except the initial exploration
 
 Writes <run>/model_eval.csv with: round, nll, mse (discounted H-step joint-position
 MSE), mse_vel (one-step velocity MSE, the MBPO "Model Err" definition), n_windows.
@@ -43,6 +46,8 @@ def main():
     p.add_argument("--data-rounds", default="11-400",
                    help="inclusive round range of data to evaluate on (default: skip rounds 1-10 exploration)")
     p.add_argument("--ckpt-rounds", default=None, help="inclusive round range of checkpoints (default: all)")
+    p.add_argument("--cumulative", action="store_true",
+                   help="score checkpoint i on data rounds [start..i] instead of the fixed slice")
     p.add_argument("--stride", type=int, default=8, help="window start stride within each 150-step episode")
     p.add_argument("--batch", type=int, default=4096, help="windows per jit call")
     p.add_argument("--out", default=None, help="output csv (default <run>/model_eval.csv)")
@@ -66,26 +71,29 @@ def main():
     if not data_rounds or not ckpt_rounds:
         raise SystemExit(f"nothing to do: {len(data_rounds)} data rounds, {len(ckpt_rounds)} checkpoints")
 
-    # deterministic strided windows over every episode of the selected rounds
-    wins = []
+    # deterministic strided windows over every episode of the selected rounds,
+    # kept in round order with cumulative bounds so --cumulative can slice prefixes
+    wins, bounds = [], {}
     for r in data_rounds:
         arr = np.load(os.path.join(args.run, "data", f"round_{r:03d}.npy"))  # (E, T, 3*jd*bd)
         for e in range(arr.shape[0]):
             for st in range(0, arr.shape[1] - (H + 1), args.stride):
                 wins.append(arr[e, st:st + H + 1])
+        bounds[r] = len(wins)
     wins = np.asarray(wins, np.float32)
-    print(f"{len(wins)} windows from rounds {data_rounds[0]}-{data_rounds[-1]} "
+    n_total = len(wins)
+    print(f"{n_total} windows from rounds {data_rounds[0]}-{data_rounds[-1]} "
           f"({len(data_rounds)} rounds, stride {args.stride})")
 
     B = args.batch
-    pad = (-len(wins)) % B
-    weights = np.concatenate([np.ones(len(wins)), np.zeros(pad)]).astype(np.float32)
-    wins = np.concatenate([wins, np.repeat(wins[-1:], pad, axis=0)]) if pad else wins
-    wins_d = jnp.asarray(wins).reshape(-1, B, H + 1, wins.shape[-1])
-    weights = jnp.asarray(weights).reshape(-1, B)
+    pad = (-n_total) % B
+    if pad:
+        wins = np.concatenate([wins, np.zeros((pad,) + wins.shape[1:], np.float32)])
+    wins_d = jnp.asarray(wins)                       # resident on device once
 
     @nnx.jit
-    def score(ens, chunk, w):
+    def score(ens, chunk, k):
+        w = (jnp.arange(chunk.shape[0]) < k).astype(jnp.float32)
         states = jax.vmap(jax.vmap(lambda x: _input_to_state(x, jd, bd)))(chunk)
         actions = states.act_buffer[:, :, -jd:]
         f_nll = lambda e, s, a: rollout_loss(e, s, a, jd, mode, dt, gamma, H, input_idx=None)
@@ -97,24 +105,31 @@ def main():
             pred_qd = s0.get_qd() + mu if mode == "dv" else mu
             return jnp.mean((pred_qd - s.qd_buffer[1, -jd:]) ** 2)
         vm = lambda f: nnx.vmap(f, in_axes=(None, 0, 0))(ens, states, actions)
-        n = jnp.sum(w)
-        return (jnp.sum(vm(f_nll) * w) / n, jnp.sum(vm(f_mse) * w) / n, jnp.sum(vm(f_vel) * w) / n)
+        return jnp.stack([jnp.sum(vm(f_nll) * w), jnp.sum(vm(f_mse) * w), jnp.sum(vm(f_vel) * w)])
 
-    out = args.out or os.path.join(args.run, "model_eval.csv")
+    out = args.out or os.path.join(args.run, "model_eval_cum.csv" if args.cumulative else "model_eval.csv")
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["round", "nll", "mse", "mse_vel", "n_windows",
-                    f"data_rounds={data_rounds[0]}-{data_rounds[-1]}"])
+        w.writerow(["round", "nll", "mse", "mse_vel", "n_windows", "data_rounds"])
         for r in ckpt_rounds:
+            if args.cumulative:
+                past = [x for x in data_rounds if x <= r]
+                n = bounds[past[-1]] if past else 0
+                tag = f"{data_rounds[0]}-{past[-1]}" if past else "none"
+            else:
+                n, tag = n_total, f"{data_rounds[0]}-{data_rounds[-1]}"
+            if n == 0:
+                w.writerow([r, "nan", "nan", "nan", 0, tag]); f.flush()
+                continue
             params = pickle.load(open(os.path.join(args.run, "ckpt", f"params_{r:03d}.pkl"), "rb"))
             ens = nnx.merge(graphdef, jax.device_put(params))
             acc = np.zeros(3)
-            for chunk, wt in zip(wins_d, weights):
-                acc += np.asarray(jax.device_get(score(ens, chunk, wt))) * float(jnp.sum(wt))
-            nll, mse, mse_vel = acc / float(weights.sum())
-            w.writerow([r, f"{nll:.6e}", f"{mse:.6e}", f"{mse_vel:.6e}", len(wins) - pad, ""])
+            for i in range(0, n, B):
+                acc += np.asarray(jax.device_get(score(ens, wins_d[i:i + B], min(B, n - i))))
+            nll, mse, mse_vel = acc / n
+            w.writerow([r, f"{nll:.6e}", f"{mse:.6e}", f"{mse_vel:.6e}", n, tag])
             f.flush()
-            print(f"ckpt {r:3d}: nll {nll:9.3f}  mse {mse:.3e}  mse_vel {mse_vel:.3e}", flush=True)
+            print(f"ckpt {r:3d}: nll {nll:9.3f}  mse {mse:.3e}  mse_vel {mse_vel:.3e}  (n={n})", flush=True)
     print("wrote", out)
 
 
