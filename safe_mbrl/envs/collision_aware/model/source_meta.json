@@ -1,0 +1,160 @@
+{
+  "episode_idx": 73,
+  "model_kwargs": {
+    "joint_dim": 5,
+    "buffer_dim": 30,
+    "model_type": "PE",
+    "mode": "v",
+    "features": [
+      256,
+      256
+    ],
+    "num_ensembles": 5,
+    "mask": {
+      "q": [
+        0,
+        25,
+        25,
+        25,
+        25
+      ],
+      "qd": [
+        25,
+        25,
+        25,
+        25,
+        25
+      ],
+      "act": [
+        25,
+        25,
+        25,
+        25,
+        25
+      ]
+    }
+  },
+  "rng_uint32": [
+    3695471522,
+    1315419400
+  ],
+  "cfg_snapshot": {
+    "joint_names": [
+      "J_TURN",
+      "J_BOOM",
+      "J_STICK",
+      "J_TELE",
+      "J_EE_PITCH"
+    ],
+    "episode": {
+      "n_traj": 10,
+      "warmup_traj": 2,
+      "t_traj": 6.0,
+      "t_step": 0.04,
+      "t_settle": 0.5,
+      "bd": 30,
+      "n_rounds": 300,
+      "track_mode": "mpcc",
+      "step_penalty_coef": 0.0,
+      "action_penalty_coef": 0.05,
+      "accel_penalty_coef": 0.0,
+      "accel_sign_penalty_coef": 0.0,
+      "qd_coef": 0.0,
+      "joint_weight": 8.0,
+      "ee_weight": 2.0,
+      "q_track_weight": null,
+      "normalize_q_cost": false
+    },
+    "explore": {
+      "episodes": 2,
+      "seconds": 60.0,
+      "amplitude": [
+        0.4,
+        0.4,
+        0.4,
+        0.4,
+        0.4
+      ],
+      "period_min": 4.0,
+      "period_max": 6.0,
+      "ramp_sec": 2.0
+    },
+    "mppi": {
+      "horizon": 30,
+      "nb_samples": 3000,
+      "temperature": 0.05,
+      "init_std": 0.5,
+      "nb_steps": 3,
+      "action_ema_alpha": [
+        0.18,
+        0.18,
+        0.18,
+        0.18,
+        0.18
+      ],
+      "current_clip_schedule": [
+        0.4,
+        0.5,
+        0.5,
+        0.6,
+        0.6,
+        0.7,
+        0.7,
+        0.8,
+        0.9,
+        1.0
+      ]
+    },
+    "model": {
+      "model_type": "PE",
+      "mode": "v",
+      "features": [
+        256,
+        256
+      ],
+      "num_ensembles": 5,
+      "mask": {
+        "q": [
+          0,
+          25,
+          25,
+          25,
+          25
+        ],
+        "qd": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "act": [
+          25,
+          25,
+          25,
+          25,
+          25
+        ]
+      }
+    },
+    "mpcc": {
+      "w_ee": 2.0,
+      "w_q": 8.0,
+      "delta_max": 3,
+      "rho": 20.0,
+      "sigma": 0.05,
+      "qd_limit": [
+        0.4,
+        0.6,
+        0.6,
+        0.6,
+        0.6
+      ],
+      "qd_limit_coef": 50.0,
+      "ee_accel_coef": 0.005,
+      "early_stop": true,
+      "early_stop_q_tol": 0.05
+    }
+  },
+  "partial": false
+}

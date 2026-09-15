@@ -757,7 +757,7 @@
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
-        <mesh filename="meshes/IMPACT_HAMMER.stl"/>
+        <mesh filename="meshes/IMPACT_HAMMER.dae"/>
       </geometry>
     </visual>
   </link>
