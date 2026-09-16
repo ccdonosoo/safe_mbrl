@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
+GENERATOR_SEED = 0   # global-numpy seed pinned while building the WarpRockGenerator (Perlin permutation)
+
 
 @dataclass
 class Rock:
@@ -58,7 +60,12 @@ class RockField:
         """
         if self._generator is None:
             from newton_ground.procedural_generation.rock_generator import WarpRockGenerator
+            # the generator shuffles its Perlin permutation table with the GLOBAL numpy RNG at
+            # construction: pin it, or the same rock seed gives a different shape in every process
+            rng_state = np.random.get_state()
+            np.random.seed(GENERATOR_SEED)
             self._generator = WarpRockGenerator(device=self.device)
+            np.random.set_state(rng_state)
 
         hull = self._generator.generate_rock(
             radius=float(radius), subdivisions=subdivisions, warp_vector=tuple(warp_vector),

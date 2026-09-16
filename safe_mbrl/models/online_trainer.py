@@ -7,9 +7,6 @@ from typing import Sequence
 from safe_mbrl.utils.structs import RobotState, Dataset
 
 
-#TODO Robustness training: random multiplicative masks sampled per batch.
-
-
 class OnlineTrainer:
 
     def __init__(self,
